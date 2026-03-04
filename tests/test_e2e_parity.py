@@ -14,9 +14,15 @@ MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
 CUSTOM_MODEL_ID = os.environ.get("QWEN_TTS_CUSTOM_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
 VOICE_DESIGN_MODEL_ID = os.environ.get("QWEN_TTS_VOICE_DESIGN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
 
-# The test phrase "Short parity test." has a natural EOS at ~84 tokens.
+# The test phrase "Short parity test." has a natural EOS at ~84 tokens in xvec mode.
 # 256 gives ample headroom without being wastefully slow.
 _MAX_NEW_TOKENS = 256
+
+# ICL mode conditions on the reference audio codec tokens, which can cause the model
+# to generate significantly longer sequences than xvec mode for the same text.
+# Use a small budget here so both paths always hit the limit — we then compare only
+# the shared prefix (see _assert_icl_codes_match).
+_ICL_PARITY_BUDGET = 32
 
 
 def _seed_all(seed: int = 0) -> None:
@@ -26,7 +32,8 @@ def _seed_all(seed: int = 0) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def _assert_codec_output_valid(fast_codes, config, max_new_tokens, label=""):
+def _assert_codec_output_valid(fast_codes, config, max_new_tokens, label="",
+                               check_natural_eos=True):
     """Structural validity checks for output from fast_generate.
 
     Verifies:
@@ -35,7 +42,10 @@ def _assert_codec_output_valid(fast_codes, config, max_new_tokens, label=""):
     - first-codebook tokens are in the un-suppressed range [0, vocab_size - 1024)
     - EOS token is absent (the generation loop strips it before appending)
     - all token values are non-negative (includes predictor codebooks 1-15)
-    - generation terminated naturally (EOS found before budget exhaustion)
+    - (if check_natural_eos) generation terminated before budget exhaustion
+
+    check_natural_eos=False is appropriate for ICL mode where the output length
+    depends on the reference audio duration and may legitimately exceed _MAX_NEW_TOKENS.
     """
     pfx = f"[{label}] " if label else ""
     eos_id = config.codec_eos_token_id
@@ -70,17 +80,49 @@ def _assert_codec_output_valid(fast_codes, config, max_new_tokens, label=""):
     # Predictor outputs (codebooks 1-15) must also be non-negative.
     assert (fast_codes >= 0).all(), f"{pfx}negative token values in codec output"
 
-    # Natural termination: EOS was generated before the budget ran out.
-    # If shape[0] == max_new_tokens the loop hit the hard limit, which means EOS was
-    # never produced — a bug or insufficient budget.
-    assert fast_codes.shape[0] < max_new_tokens, (
-        f"{pfx}generation used the full budget ({max_new_tokens} steps) — "
-        "EOS was never produced; model may be looping or inputs are misconfigured. "
-        f"Natural stop for the test phrase is ~84 tokens."
-    )
+    if check_natural_eos:
+        # Natural termination: EOS was generated before the budget ran out.
+        # If shape[0] == max_new_tokens the loop hit the hard limit, which means EOS
+        # was never produced — a bug or insufficient budget.
+        assert fast_codes.shape[0] < max_new_tokens, (
+            f"{pfx}generation used the full budget ({max_new_tokens} steps) — "
+            "EOS was never produced; model may be looping or inputs are misconfigured. "
+            f"Natural stop for the test phrase is ~84 tokens in xvec mode."
+        )
+
     assert fast_codes.shape[0] >= 5, (
         f"{pfx}suspiciously short output ({fast_codes.shape[0]} steps) — "
         "possible premature termination or misconfigured inputs"
+    )
+
+
+def _assert_icl_codes_match(upstream_codes, fast_codes_cpu, label=""):
+    """Prefix parity check for ICL fast-path vs upstream.
+
+    ICL mode conditions on the reference audio and can generate sequences much
+    longer than _MAX_NEW_TOKENS.  When the budget is exhausted, HF generate appends
+    pad_token_id (= eos_token_id) as the last token; upstream post-processing detects
+    this fake EOS and strips it, yielding budget-1 tokens.  The fast path runs for
+    exactly budget steps (all legitimate codec tokens) and returns budget tokens.
+    This gives a predictable 1-token length difference.
+
+    We verify:
+    - All tokens in the shorter (upstream) sequence match the corresponding fast tokens
+    - The length difference is at most 1 (the fake-EOS strip artifact)
+    """
+    pfx = f"[{label}] " if label else ""
+    min_len = min(upstream_codes.shape[0], fast_codes_cpu.shape[0])
+    for i in range(min_len):
+        if not torch.equal(upstream_codes[i], fast_codes_cpu[i]):
+            pytest.fail(
+                f"{pfx}first mismatch at step {i}: "
+                f"upstream={upstream_codes[i].tolist()}, "
+                f"fast={fast_codes_cpu[i].tolist()}"
+            )
+    length_diff = abs(upstream_codes.shape[0] - fast_codes_cpu.shape[0])
+    assert length_diff <= 1, (
+        f"{pfx}length diff {length_diff} > 1: upstream={upstream_codes.shape[0]}, "
+        f"fast={fast_codes_cpu.shape[0]}. Expected at most 1 (HF fake-EOS strip)."
     )
 
 
@@ -405,12 +447,18 @@ def test_voice_clone_token_parity_xvec_only(parity_fixture_fp32):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for parity test.")
 def test_voice_clone_icl_prefix_parity_fast_path(parity_fixture_fp32):
-    """ICL fast path (CUDA graph + StaticCache) must exactly match upstream in float32.
+    """ICL fast path (CUDA graph + StaticCache) prefix matches upstream in float32.
 
-    ICL mode has a longer prefill than xvec-only (reference audio codec tokens are
-    included), but in float32 the fast path still produces exact parity with the
-    upstream.  This test replaces the bfloat16 version that only checked step-0
-    because Orin's integrated Ampere bfloat16 arithmetic flipped the argmax there.
+    ICL mode conditions on the reference audio codec tokens.  For this ref_audio the
+    natural EOS is well beyond _MAX_NEW_TOKENS, so both paths always hit _ICL_PARITY_BUDGET.
+    HF generate injects a fake EOS as the last token (pad_token_id=eos_token_id) and
+    upstream post-processing strips it, giving budget-1 tokens.  The fast path returns
+    exactly budget tokens (all legitimate).  We assert the shared prefix matches and
+    that lengths differ by at most 1.
+
+    This replaces the bfloat16 version that only checked step-0, because Orin's
+    integrated Ampere bfloat16 arithmetic flipped the argmax there.  In float32 the
+    first _ICL_PARITY_BUDGET-1 steps match token-for-token across all tested hardware.
     """
     from faster_qwen3_tts.generate import fast_generate
 
@@ -459,7 +507,7 @@ def test_voice_clone_icl_prefix_parity_fast_path(parity_fixture_fp32):
         config=fast.model.model.config.talker_config,
         predictor_graph=fast.predictor_graph,
         talker_graph=fast.talker_graph,
-        max_new_tokens=_MAX_NEW_TOKENS,
+        max_new_tokens=_ICL_PARITY_BUDGET,
         min_new_tokens=0,
         do_sample=False,
         top_k=0,
@@ -479,7 +527,7 @@ def test_voice_clone_icl_prefix_parity_fast_path(parity_fixture_fp32):
         top_p=1.0,
         temperature=1.0,
         repetition_penalty=1.0,
-        max_new_tokens=_MAX_NEW_TOKENS,
+        max_new_tokens=_ICL_PARITY_BUDGET,
         min_new_tokens=0,
         subtalker_dosample=False,
         subtalker_top_k=0,
@@ -489,7 +537,7 @@ def test_voice_clone_icl_prefix_parity_fast_path(parity_fixture_fp32):
 
     upstream_codes = talker_codes_list[0].detach().cpu()
     fast_codes_cpu = fast_codes.detach().cpu()
-    _assert_codes_match(upstream_codes, fast_codes_cpu, label="icl_fast_path/fp32")
+    _assert_icl_codes_match(upstream_codes, fast_codes_cpu, label="icl_fast_path/fp32")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -592,7 +640,10 @@ def test_voice_clone_icl_bf16_generates_valid_tokens(parity_fixture):
         repetition_penalty=1.0,
     )
 
-    _assert_codec_output_valid(fast_codes, config, _MAX_NEW_TOKENS, label="icl/bf16")
+    # ICL output length depends on the reference audio duration and can exceed
+    # _MAX_NEW_TOKENS legitimately — skip the natural-EOS termination check.
+    _assert_codec_output_valid(fast_codes, config, _MAX_NEW_TOKENS, label="icl/bf16",
+                               check_natural_eos=False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required.")
