@@ -7,14 +7,17 @@ where = ["."]
 include = ["faster_qwen3_tts*"]
 
 [project]
-name = "faster-qwen3-tts"
-version = "0.2.5"
-description = "Real-time Qwen3-TTS inference using manual CUDA graph capture"
+name = "faster-qwen3-tts-universal"
+version = "0.3.0"
+description = "Real-time Qwen3-TTS inference with universal language support (including Uzbek, Karakalpak, and fine-tuned models)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Andres Marafioti" }]
-keywords = ["tts", "qwen", "cuda", "cudagraph", "streaming"]
+authors = [
+    { name = "Andres Marafioti" },
+    { name = "Davronbek Achilov", email = "davron211@gmail.com" },
+]
+keywords = ["tts", "qwen", "cuda", "cudagraph", "streaming", "uzbek", "multilingual"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -46,5 +49,5 @@ demo = [
 faster-qwen3-tts = "faster_qwen3_tts.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/andimarafioti/faster-qwen3-tts"
-Repository = "https://github.com/andimarafioti/faster-qwen3-tts"
+Homepage = "https://github.com/davronbek/faster-qwen3-tts-universal"
+Repository = "https://github.com/davronbek/faster-qwen3-tts-universal"

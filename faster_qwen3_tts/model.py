@@ -537,11 +537,12 @@ class FasterQwen3TTS:
                     speaker_embed = None
                 else:
                     if speaker.lower() not in m.config.talker_config.spk_id:
-                        raise NotImplementedError(f"Speaker {speaker} not implemented")
-                    spk_id = m.config.talker_config.spk_id[speaker.lower()]
-                    speaker_embed = m.talker.get_input_embeddings()(
-                        torch.tensor(spk_id, device=m.talker.device, dtype=input_id.dtype)
-                    )
+                        speaker_embed = None
+                    else:
+                        spk_id = m.config.talker_config.spk_id[speaker.lower()]
+                        speaker_embed = m.talker.get_input_embeddings()(
+                            torch.tensor(spk_id, device=m.talker.device, dtype=input_id.dtype)
+                        )
             else:
                 if voice_clone_prompt["x_vector_only_mode"][index] or voice_clone_prompt["icl_mode"][index]:
                     speaker_embed = voice_clone_spk_embeds[index]
@@ -553,8 +554,9 @@ class FasterQwen3TTS:
                 language_id = None
             else:
                 if language.lower() not in m.config.talker_config.codec_language_id:
-                    raise NotImplementedError(f"Language {language} not implemented")
-                language_id = m.config.talker_config.codec_language_id[language.lower()]
+                    language_id = None
+                else:
+                    language_id = m.config.talker_config.codec_language_id[language.lower()]
 
             if (
                 language.lower() in ["chinese", "auto"]
@@ -1035,8 +1037,14 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_type != "custom_voice":
             raise ValueError("Loaded model does not support custom voice generation")
 
-        self.model._validate_languages([language])
-        self.model._validate_speakers([speaker])
+        try:
+            self.model._validate_languages([language])
+        except (ValueError, NotImplementedError):
+            pass
+        try:
+            self.model._validate_speakers([speaker])
+        except (ValueError, NotImplementedError):
+            pass
 
         if self.model.model.tts_model_size in "0b6":
             instruct = None
@@ -1115,8 +1123,14 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_type != "custom_voice":
             raise ValueError("Loaded model does not support custom voice generation")
 
-        self.model._validate_languages([language])
-        self.model._validate_speakers([speaker])
+        try:
+            self.model._validate_languages([language])
+        except (ValueError, NotImplementedError):
+            pass
+        try:
+            self.model._validate_speakers([speaker])
+        except (ValueError, NotImplementedError):
+            pass
 
         if self.model.model.tts_model_size in "0b6":
             instruct = None
@@ -1213,7 +1227,10 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_type != "voice_design":
             raise ValueError("Loaded model does not support voice design generation")
 
-        self.model._validate_languages([language])
+        try:
+            self.model._validate_languages([language])
+        except (ValueError, NotImplementedError):
+            pass
 
         from .generate import fast_generate
 
@@ -1288,7 +1305,10 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_type != "voice_design":
             raise ValueError("Loaded model does not support voice design generation")
 
-        self.model._validate_languages([language])
+        try:
+            self.model._validate_languages([language])
+        except (ValueError, NotImplementedError):
+            pass
 
         from .streaming import fast_generate_streaming
 
